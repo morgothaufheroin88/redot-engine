@@ -681,14 +681,89 @@ private:
 			}
 		};
 
+		// The key sort exists to group identical surfaces (for instancing and to
+		// avoid pipeline/material rebinds) while respecting priority, surface
+		// index and depth layer; the relative order of different shader, material
+		// and geometry ids is irrelevant. That allows a 64-bit key with those ids
+		// hashed into the low bits, sorted with an LSD radix sort: unlike the
+		// comparison sort it has no data-dependent branches, which dominated the
+		// cost with tens of thousands of surfaces (sorted once per pass, so five
+		// times a frame with directional shadows).
+		struct SortEntry {
+			uint64_t key;
+			GeometryInstanceSurfaceDataCache *element;
+		};
+		LocalVector<SortEntry> sort_entries;
+		LocalVector<SortEntry> sort_scratch;
+
+		static _FORCE_INLINE_ uint64_t _radix_key(const GeometryInstanceSurfaceDataCache *p_element) {
+			uint32_t h = hash_murmur3_one_32(uint32_t(p_element->sort.shader_id));
+			h = hash_murmur3_one_32(uint32_t(p_element->sort.material_id), h);
+			h = hash_murmur3_one_32(uint32_t(p_element->sort.geometry_id), h);
+			uint64_t key = hash_fmix32(h);
+			key |= uint64_t(p_element->sort.lod_index) << 32;
+			key |= uint64_t(p_element->sort.uses_softshadow | (p_element->sort.uses_projector << 1) | (p_element->sort.uses_forward_gi << 2) | (p_element->sort.uses_lightmap << 3)) << 40;
+			key |= uint64_t(p_element->sort.depth_layer) << 44;
+			key |= uint64_t(p_element->sort.surface_index) << 48;
+			key |= uint64_t(p_element->sort.priority) << 56;
+			return key;
+		}
+
+		void _radix_sort_by_key(uint32_t p_from, uint32_t p_size) {
+			if (p_size < 2) {
+				return;
+			}
+			GeometryInstanceSurfaceDataCache **from = elements.ptr() + p_from;
+			if (p_size < 2048) {
+				SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
+				sorter.sort(from, p_size);
+				return;
+			}
+
+			sort_entries.resize(p_size);
+			sort_scratch.resize(p_size);
+			SortEntry *src = sort_entries.ptr();
+			SortEntry *dst = sort_scratch.ptr();
+
+			uint32_t histogram[8][256] = {};
+			for (uint32_t i = 0; i < p_size; i++) {
+				const uint64_t key = _radix_key(from[i]);
+				src[i].key = key;
+				src[i].element = from[i];
+				for (uint32_t pass = 0; pass < 8; pass++) {
+					histogram[pass][(key >> (pass * 8)) & 0xFF]++;
+				}
+			}
+
+			for (uint32_t pass = 0; pass < 8; pass++) {
+				const uint32_t shift = pass * 8;
+				uint32_t *h = histogram[pass];
+				if (h[(src[0].key >> shift) & 0xFF] == p_size) {
+					continue; // Every key has the same digit, nothing to do for this pass.
+				}
+				uint32_t sum = 0;
+				for (uint32_t b = 0; b < 256; b++) {
+					const uint32_t count = h[b];
+					h[b] = sum;
+					sum += count;
+				}
+				for (uint32_t i = 0; i < p_size; i++) {
+					dst[h[(src[i].key >> shift) & 0xFF]++] = src[i];
+				}
+				SWAP(src, dst);
+			}
+
+			for (uint32_t i = 0; i < p_size; i++) {
+				from[i] = src[i].element;
+			}
+		}
+
 		void sort_by_key() {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr(), elements.size());
+			_radix_sort_by_key(0, elements.size());
 		}
 
 		void sort_by_key_range(uint32_t p_from, uint32_t p_size) {
-			SortArray<GeometryInstanceSurfaceDataCache *, SortByKey> sorter;
-			sorter.sort(elements.ptr() + p_from, p_size);
+			_radix_sort_by_key(p_from, p_size);
 		}
 
 		struct SortByDepth {
