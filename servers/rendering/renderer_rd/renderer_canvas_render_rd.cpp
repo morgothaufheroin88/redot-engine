@@ -305,31 +305,56 @@ RendererCanvasRender::PolygonID RendererCanvasRenderRD::request_polygon(const Ve
 	RD::VertexFormatID vertex_id = RD::get_singleton()->vertex_format_create(descriptions);
 	ERR_FAIL_COND_V(vertex_id == RD::INVALID_ID, 0);
 
+	const uint32_t index_count = p_indices.size() ? (uint32_t)p_count : 0;
+
+	PolygonPoolKey key;
+	key.vertex_format_id = vertex_id;
+	key.vertex_count = vertex_count;
+	key.index_count = index_count;
+
 	PolygonBuffers pb;
-	pb.vertex_buffer = RD::get_singleton()->vertex_buffer_create(polygon_buffer.size(), polygon_buffer);
-	for (int i = 0; i < descriptions.size(); i++) {
-		if (buffers[i] == RID()) { //if put in vertex, use as vertex
-			buffers.write[i] = pb.vertex_buffer;
+	LocalVector<PolygonBuffers> *pooled = polygon_buffers.pool.getptr(key);
+	if (pooled && !pooled->is_empty()) {
+		// Reuse the device resources of a freed polygon with the same shape.
+		pb = (*pooled)[pooled->size() - 1];
+		pooled->remove_at(pooled->size() - 1);
+		polygon_buffers.pool_entries--;
+		polygon_buffers.pool_bytes -= pb.vertex_buffer_size + index_count * sizeof(int32_t);
+		ERR_FAIL_COND_V(pb.vertex_buffer_size != (uint32_t)polygon_buffer.size(), 0); // Bug: same key must mean same size.
+
+		RD::get_singleton()->buffer_update(pb.vertex_buffer, 0, polygon_buffer.size(), polygon_buffer.ptr());
+		if (index_count) {
+			RD::get_singleton()->buffer_update(pb.index_buffer, 0, index_count * sizeof(int32_t), p_indices.ptr());
 		}
+	} else {
+		pb.vertex_buffer = RD::get_singleton()->vertex_buffer_create(polygon_buffer.size(), polygon_buffer);
+		for (int i = 0; i < descriptions.size(); i++) {
+			if (buffers[i] == RID()) { //if put in vertex, use as vertex
+				buffers.write[i] = pb.vertex_buffer;
+			}
+		}
+
+		pb.vertex_array = RD::get_singleton()->vertex_array_create(p_points.size(), vertex_id, buffers);
+
+		if (index_count) {
+			//create indices, as indices were requested
+			Vector<uint8_t> index_buffer;
+			index_buffer.resize(index_count * sizeof(int32_t));
+			{
+				uint8_t *w = index_buffer.ptrw();
+				memcpy(w, p_indices.ptr(), sizeof(int32_t) * MIN((uint32_t)p_indices.size(), index_count));
+			}
+			pb.index_buffer = RD::get_singleton()->index_buffer_create(index_count, RD::INDEX_BUFFER_FORMAT_UINT32, index_buffer);
+			pb.indices = RD::get_singleton()->index_array_create(pb.index_buffer, 0, index_count);
+		}
+
+		pb.vertex_format_id = vertex_id;
+		pb.vertex_count = vertex_count;
+		pb.index_count = index_count;
+		pb.vertex_buffer_size = polygon_buffer.size();
 	}
 
-	pb.vertex_array = RD::get_singleton()->vertex_array_create(p_points.size(), vertex_id, buffers);
-	pb.primitive_count = vertex_count;
-
-	if (p_indices.size()) {
-		//create indices, as indices were requested
-		Vector<uint8_t> index_buffer;
-		index_buffer.resize(p_count * sizeof(int32_t));
-		{
-			uint8_t *w = index_buffer.ptrw();
-			memcpy(w, p_indices.ptr(), sizeof(int32_t) * p_indices.size());
-		}
-		pb.index_buffer = RD::get_singleton()->index_buffer_create(p_count, RD::INDEX_BUFFER_FORMAT_UINT32, index_buffer);
-		pb.indices = RD::get_singleton()->index_array_create(pb.index_buffer, 0, p_count);
-		pb.primitive_count = p_count;
-	}
-
-	pb.vertex_format_id = vertex_id;
+	pb.primitive_count = index_count ? index_count : vertex_count;
 
 	PolygonID id = polygon_buffers.last_id++;
 
@@ -342,19 +367,58 @@ void RendererCanvasRenderRD::free_polygon(PolygonID p_polygon) {
 	PolygonBuffers *pb_ptr = polygon_buffers.polygons.getptr(p_polygon);
 	ERR_FAIL_NULL(pb_ptr);
 
-	PolygonBuffers &pb = *pb_ptr;
-
-	if (pb.indices.is_valid()) {
-		RD::get_singleton()->free(pb.indices);
-	}
-	if (pb.index_buffer.is_valid()) {
-		RD::get_singleton()->free(pb.index_buffer);
-	}
-
-	RD::get_singleton()->free(pb.vertex_array);
-	RD::get_singleton()->free(pb.vertex_buffer);
-
+	PolygonBuffers pb = *pb_ptr;
 	polygon_buffers.polygons.erase(p_polygon);
+
+	const uint64_t bytes = pb.vertex_buffer_size + pb.index_count * sizeof(int32_t);
+	if (polygon_buffers.pool_entries >= POLYGON_POOL_MAX_ENTRIES || polygon_buffers.pool_bytes + bytes > POLYGON_POOL_MAX_BYTES) {
+		_polygon_buffers_free(pb);
+		return;
+	}
+
+	PolygonPoolKey key;
+	key.vertex_format_id = pb.vertex_format_id;
+	key.vertex_count = pb.vertex_count;
+	key.index_count = pb.index_count;
+
+	pb.pooled_frame = polygon_buffers.frame;
+	polygon_buffers.pool[key].push_back(pb);
+	polygon_buffers.pool_entries++;
+	polygon_buffers.pool_bytes += bytes;
+}
+
+void RendererCanvasRenderRD::_polygon_buffers_free(const PolygonBuffers &p_pb) {
+	if (p_pb.indices.is_valid()) {
+		RD::get_singleton()->free(p_pb.indices);
+	}
+	if (p_pb.index_buffer.is_valid()) {
+		RD::get_singleton()->free(p_pb.index_buffer);
+	}
+
+	RD::get_singleton()->free(p_pb.vertex_array);
+	RD::get_singleton()->free(p_pb.vertex_buffer);
+}
+
+void RendererCanvasRenderRD::_polygon_pool_trim() {
+	// Release entries that no polygon has asked for in a while. Entries are
+	// pushed and popped at the back, so the stale ones accumulate at the front.
+	const uint64_t frame = polygon_buffers.frame;
+	for (KeyValue<PolygonPoolKey, LocalVector<PolygonBuffers>> &E : polygon_buffers.pool) {
+		LocalVector<PolygonBuffers> &entries = E.value;
+		uint32_t stale = 0;
+		while (stale < entries.size() && frame - entries[stale].pooled_frame > POLYGON_POOL_MAX_IDLE_FRAMES) {
+			_polygon_buffers_free(entries[stale]);
+			polygon_buffers.pool_entries--;
+			polygon_buffers.pool_bytes -= entries[stale].vertex_buffer_size + entries[stale].index_count * sizeof(int32_t);
+			stale++;
+		}
+		if (stale > 0) {
+			for (uint32_t i = stale; i < entries.size(); i++) {
+				entries[i - stale] = entries[i];
+			}
+			entries.resize(entries.size() - stale);
+		}
+	}
 }
 
 ////////////////////
@@ -1721,6 +1785,10 @@ void RendererCanvasRenderRD::set_time(double p_time) {
 }
 
 void RendererCanvasRenderRD::update() {
+	polygon_buffers.frame++;
+	if ((polygon_buffers.frame % 16) == 0) {
+		_polygon_pool_trim();
+	}
 }
 
 RendererCanvasRenderRD::RendererCanvasRenderRD() {
@@ -3334,6 +3402,16 @@ RendererCanvasRenderRD::~RendererCanvasRenderRD() {
 		RD::get_singleton()->free(shader.quad_index_array);
 		RD::get_singleton()->free(shader.quad_index_buffer);
 		//primitives are erase by dependency
+	}
+
+	//pooled polygon buffers
+	{
+		for (KeyValue<PolygonPoolKey, LocalVector<PolygonBuffers>> &E : polygon_buffers.pool) {
+			for (const PolygonBuffers &pb : E.value) {
+				_polygon_buffers_free(pb);
+			}
+		}
+		polygon_buffers.pool.clear();
 	}
 
 	if (state.shadow_fb.is_valid()) {

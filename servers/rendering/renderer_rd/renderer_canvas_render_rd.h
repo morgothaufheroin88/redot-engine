@@ -238,12 +238,53 @@ class RendererCanvasRenderRD : public RendererCanvasRender {
 		RID index_buffer;
 		RID indices;
 		uint32_t primitive_count = 0;
+		uint32_t vertex_count = 0;
+		uint32_t index_count = 0;
+		uint32_t vertex_buffer_size = 0;
+		uint64_t pooled_frame = 0;
 	};
+
+	// Freed polygon buffers are kept for reuse instead of going back to the
+	// RenderingDevice. Every redraw of a CanvasItem re-creates its polygons
+	// (StyleBoxFlat, draw_polygon(), Polygon2D...), and creating them from
+	// scratch costs a device allocation plus RID and dependency bookkeeping
+	// for each of the vertex buffer, vertex array and index buffer/array.
+	// The key pins the vertex format and counts, so the vertex/index arrays
+	// of a pooled entry can be reused as-is with only a buffer update.
+	struct PolygonPoolKey {
+		RD::VertexFormatID vertex_format_id = 0;
+		uint32_t vertex_count = 0;
+		uint32_t index_count = 0;
+
+		bool operator==(const PolygonPoolKey &p_key) const {
+			return vertex_format_id == p_key.vertex_format_id && vertex_count == p_key.vertex_count && index_count == p_key.index_count;
+		}
+	};
+
+	struct PolygonPoolKeyHasher {
+		static _FORCE_INLINE_ uint32_t hash(const PolygonPoolKey &p_key) {
+			uint32_t h = hash_murmur3_one_64(p_key.vertex_format_id);
+			h = hash_murmur3_one_32(p_key.vertex_count, h);
+			h = hash_murmur3_one_32(p_key.index_count, h);
+			return hash_fmix32(h);
+		}
+	};
+
+	static constexpr uint32_t POLYGON_POOL_MAX_ENTRIES = 4096;
+	static constexpr uint64_t POLYGON_POOL_MAX_BYTES = 32 * 1024 * 1024;
+	static constexpr uint64_t POLYGON_POOL_MAX_IDLE_FRAMES = 120;
 
 	struct {
 		HashMap<PolygonID, PolygonBuffers> polygons;
 		PolygonID last_id;
+		HashMap<PolygonPoolKey, LocalVector<PolygonBuffers>, PolygonPoolKeyHasher> pool;
+		uint32_t pool_entries = 0;
+		uint64_t pool_bytes = 0;
+		uint64_t frame = 0;
 	} polygon_buffers;
+
+	void _polygon_buffers_free(const PolygonBuffers &p_pb);
+	void _polygon_pool_trim();
 
 	/// @}
 	/// @name PRIMITIVES
