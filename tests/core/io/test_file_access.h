@@ -109,6 +109,52 @@ TEST_CASE("[FileAccess] Get as UTF-8 String") {
 	CHECK(s_cr_nocr == "Hello darknessMy old friendI've come to talkWith you again");
 }
 
+TEST_CASE("[FileAccess] Get line") {
+	const String path = TestUtils::get_temp_path("get_line.txt");
+	Ref<FileAccess> f = FileAccess::open(path, FileAccess::WRITE_READ);
+	REQUIRE(f.is_valid());
+
+	const char *data =
+			"first\n"
+			"second\r\n" // CR is dropped.
+			"third\0after\n" // NUL terminates a line like LF does.
+			"\n" // Empty line.
+			"\xEF\xBB\xBF" // A UTF-8 BOM at the start of a line is stripped.
+			"bom\n"
+			"\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82\n" // "привет"
+			"last"; // No trailing newline.
+	const uint64_t data_len = 6 + 8 + 12 + 1 + 7 + 13 + 4;
+	f->store_buffer((const uint8_t *)data, data_len);
+	f->seek(0);
+
+	CHECK(f->get_line() == "first");
+	CHECK(f->get_position() == 6);
+	CHECK(f->get_line() == "second");
+	CHECK(f->get_line() == "third");
+	CHECK(f->get_line() == "after");
+	CHECK(f->get_line() == "");
+	CHECK(f->get_line() == "bom");
+	CHECK(f->get_line() == String::utf8("\xD0\xBF\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82"));
+	CHECK_FALSE(f->eof_reached());
+	CHECK(f->get_line() == "last");
+	CHECK(f->eof_reached());
+	CHECK(f->get_position() == data_len);
+	// Reading past the end keeps returning empty lines.
+	CHECK(f->get_line() == "");
+	CHECK(f->eof_reached());
+
+	// A line longer than any internal buffer.
+	f->seek_end();
+	String long_line = String("x").repeat(100000);
+	f->store_string("\n" + long_line + "\n");
+	f->seek(data_len + 1);
+	CHECK(f->get_line() == long_line);
+	CHECK_FALSE(f->eof_reached());
+
+	f.unref();
+	DirAccess::remove_absolute(path);
+}
+
 TEST_CASE("[FileAccess] Get/Store floating point values") {
 	// BigEndian Hex: 0x40490E56
 	// LittleEndian Hex: 0x560E4940

@@ -111,6 +111,53 @@ public:
 	virtual Error _set_read_only_attribute(const String &p_file, bool p_ro) = 0;
 
 protected:
+	// Line accumulator for get_line(): 256 bytes on the stack, heap beyond that.
+	class CharBuffer {
+		Vector<char> vector;
+		char stack_buffer[256];
+
+		char *buffer = nullptr;
+		int64_t capacity = 0;
+		int64_t written = 0;
+
+		bool grow() {
+			if (vector.resize(next_power_of_2((uint64_t)1 + (uint64_t)written)) != OK) {
+				return false;
+			}
+
+			if (buffer == stack_buffer) { // first chunk?
+
+				for (int64_t i = 0; i < written; i++) {
+					vector.write[i] = stack_buffer[i];
+				}
+			}
+
+			buffer = vector.ptrw();
+			capacity = vector.size();
+			ERR_FAIL_COND_V(written >= capacity, false);
+
+			return true;
+		}
+
+	public:
+		_FORCE_INLINE_ CharBuffer() :
+				buffer(stack_buffer),
+				capacity(std::size(stack_buffer)) {
+		}
+
+		_FORCE_INLINE_ void push_back(char c) {
+			if (written >= capacity) {
+				ERR_FAIL_COND(!grow());
+			}
+
+			buffer[written++] = c;
+		}
+
+		_FORCE_INLINE_ const char *get_data() const {
+			return buffer;
+		}
+	};
+
 	static void _bind_methods();
 
 	AccessType get_access_type() const;

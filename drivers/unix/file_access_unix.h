@@ -79,6 +79,7 @@ public:
 	virtual bool eof_reached() const override; ///< reading passed EOF
 
 	virtual uint64_t get_buffer(uint8_t *p_dst, uint64_t p_length) const override;
+	virtual String get_line() const override;
 
 	virtual Error get_error() const override; ///< get last error
 

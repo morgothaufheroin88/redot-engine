@@ -357,6 +357,43 @@ uint64_t FileAccessWindows::get_buffer(uint8_t *p_dst, uint64_t p_length) const 
 	return read;
 }
 
+String FileAccessWindows::get_line() const {
+	ERR_FAIL_NULL_V(f, String());
+
+	if (flags == READ_WRITE || flags == WRITE_READ) {
+		if (prev_op == WRITE) {
+			fflush(f);
+		}
+		prev_op = READ;
+	}
+
+	// Same semantics as FileAccess::get_line() (stop at '\n' or '\0', drop '\r',
+	// return what was read so far on EOF/error), but reading straight from the
+	// stdio buffer. The generic implementation pays fread() + feof() + ferror()
+	// and three virtual calls for every single byte. The stream lock is taken
+	// once per line instead, so concurrent stdio calls on the same FILE stay
+	// serialized exactly as with fread().
+	// NOTE: Keep in sync with FileAccess::get_line(). Upstream Godot changed the
+	// line-ending rules in godotengine/godot#110867 (a lone '\r' also ends a line);
+	// when that lands here, this override must follow.
+	CharBuffer line;
+	_lock_file(f);
+	while (true) {
+		int c = _getc_nolock(f);
+		if (c == EOF || c == '\n' || c == '\0') {
+			break;
+		}
+		if (c != '\r') {
+			line.push_back(char(c));
+		}
+	}
+	_unlock_file(f);
+	check_errors();
+
+	line.push_back(0);
+	return String::utf8(line.get_data());
+}
+
 Error FileAccessWindows::get_error() const {
 	return last_error;
 }
