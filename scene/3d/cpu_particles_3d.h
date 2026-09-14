@@ -93,7 +93,8 @@ private:
 	bool active = false;
 
 	struct Particle {
-		Transform3D transform;
+		Transform3D transform; // Basis is kept orthonormal; `scale` is applied when filling the instance buffer.
+		Vector3 scale = Vector3(1, 1, 1);
 		Color color;
 		real_t custom[4] = {};
 		Vector3 velocity;
@@ -156,6 +157,36 @@ private:
 	bool use_fixed_seed = false;
 
 	Transform3D inv_emission_transform;
+	// Bounds of the active particles, computed while filling the instance buffer
+	// and handed to the RenderingServer as the multimesh's custom AABB so it does
+	// not have to rebuild the AABB from every instance transform each frame.
+	// Only used while no visibility_aabb is set.
+	AABB computed_aabb;
+	bool computed_aabb_valid = false;
+	struct AABBAccumulator {
+		Vector3 origin_min;
+		Vector3 origin_max;
+		real_t max_axis_sq = 0.0;
+		bool first = true;
+
+		_FORCE_INLINE_ void add(const Transform3D &p_xform) {
+			if (first) {
+				origin_min = origin_max = p_xform.origin;
+				first = false;
+			} else {
+				origin_min = origin_min.min(p_xform.origin);
+				origin_max = origin_max.max(p_xform.origin);
+			}
+			// The basis is a scaled rotation, so the longest column bounds how far
+			// any mesh vertex can be from the instance origin.
+			max_axis_sq = MAX(max_axis_sq, MAX(p_xform.basis.get_column(0).length_squared(), MAX(p_xform.basis.get_column(1).length_squared(), p_xform.basis.get_column(2).length_squared())));
+		}
+
+		AABB finish(real_t p_mesh_radius) const {
+			const Vector3 extent = Vector3(1, 1, 1) * (p_mesh_radius * Math::sqrt(max_axis_sq));
+			return AABB(origin_min - extent, origin_max - origin_min + extent * 2.0);
+		}
+	};
 
 	SafeFlag can_update;
 

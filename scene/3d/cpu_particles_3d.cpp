@@ -567,6 +567,9 @@ bool CPUParticles3D::get_split_scale() {
 
 AABB CPUParticles3D::capture_aabb() const {
 	RS::get_singleton()->multimesh_set_custom_aabb(multimesh, AABB());
+	// With no custom AABB the server derives it from the instance data, so push
+	// the current data again to get an exact, up-to-date result.
+	RS::get_singleton()->multimesh_set_buffer(multimesh, particle_data);
 	return RS::get_singleton()->multimesh_get_aabb(multimesh);
 }
 
@@ -986,6 +989,7 @@ void CPUParticles3D::_particles_process(double p_delta) {
 			if (!local_coords) {
 				p.velocity = velocity_xform.xform(p.velocity);
 				p.transform = emission_xform * p.transform;
+				p.transform.basis.orthonormalize(); // Particles never inherit the emitter's scale.
 			}
 
 			if (particle_flags[PARTICLE_FLAG_DISABLE_Z]) {
@@ -1205,8 +1209,6 @@ void CPUParticles3D::_particles_process(double p_delta) {
 					p.transform.basis.set_column(2, p.transform.basis.get_column(0).cross(p.transform.basis.get_column(1)).normalized());
 					p.transform.basis.set_column(0, p.transform.basis.get_column(1).cross(p.transform.basis.get_column(2)).normalized());
 				}
-			} else {
-				p.transform.basis.orthonormalize();
 			}
 
 			//turn particle by rotation in Y
@@ -1216,8 +1218,11 @@ void CPUParticles3D::_particles_process(double p_delta) {
 			}
 		}
 
-		p.transform.basis = p.transform.basis.orthonormalized();
-		//scale by scale
+		// The basis is a pure rotation here in every branch above (rebuilt from
+		// unit vectors, or untouched), so no re-orthonormalization is needed.
+		// The scale is stored separately and applied when the instance buffer is
+		// filled, which is what used to require two Gram-Schmidt passes per
+		// particle per frame to undo the previous frame's scale.
 
 		Vector3 base_scale = tex_scale * Math::lerp(parameters_min[PARAM_SCALE], parameters_max[PARAM_SCALE], p.scale_rand);
 		if (base_scale.x < CMP_EPSILON) {
@@ -1230,7 +1235,7 @@ void CPUParticles3D::_particles_process(double p_delta) {
 			base_scale.z = CMP_EPSILON;
 		}
 
-		p.transform.basis.scale(base_scale);
+		p.scale = base_scale;
 
 		if (particle_flags[PARTICLE_FLAG_DISABLE_Z]) {
 			p.velocity.z = 0.0;
@@ -1292,16 +1297,26 @@ void CPUParticles3D::_update_particle_data_buffer() {
 		}
 	}
 
+	// Conservative bounds: instance origins grown by the mesh's bounding radius.
+	real_t mesh_radius = 0.0;
+	if (mesh.is_valid()) {
+		const AABB mesh_aabb = mesh->get_aabb();
+		mesh_radius = (mesh_aabb.position.abs().max(mesh_aabb.get_end().abs())).length();
+	}
+	AABBAccumulator aabb;
+
 	for (int i = 0; i < pc; i++) {
 		int idx = order ? order[i] : i;
 
 		Transform3D t = r[idx].transform;
+		t.basis.scale(r[idx].scale);
 
 		if (!local_coords) {
 			t = inv_emission_transform * t;
 		}
 
 		if (r[idx].active) {
+			aabb.add(t);
 			ptr[0] = t.basis.rows[0][0];
 			ptr[1] = t.basis.rows[0][1];
 			ptr[2] = t.basis.rows[0][2];
@@ -1333,6 +1348,9 @@ void CPUParticles3D::_update_particle_data_buffer() {
 		ptr += 20;
 	}
 
+	computed_aabb = aabb.finish(mesh_radius);
+	computed_aabb_valid = !aabb.first;
+
 	can_update.set();
 }
 
@@ -1363,6 +1381,9 @@ void CPUParticles3D::_update_render_thread() {
 	MutexLock lock(update_mutex);
 
 	if (can_update.is_set()) {
+		if (visibility_aabb == AABB() && computed_aabb_valid) {
+			RS::get_singleton()->multimesh_set_custom_aabb(multimesh, computed_aabb);
+		}
 		RS::get_singleton()->multimesh_set_buffer(multimesh, particle_data);
 		can_update.clear(); //wait for next time
 	}
@@ -1404,10 +1425,20 @@ void CPUParticles3D::_notification(int p_what) {
 				const Particle *r = particles.ptr();
 				float *ptr = w;
 
+				real_t mesh_radius = 0.0;
+				if (mesh.is_valid()) {
+					const AABB mesh_aabb = mesh->get_aabb();
+					mesh_radius = (mesh_aabb.position.abs().max(mesh_aabb.get_end().abs())).length();
+				}
+				AABBAccumulator aabb;
+
 				for (int i = 0; i < pc; i++) {
-					Transform3D t = inv_emission_transform * r[i].transform;
+					Transform3D t = r[i].transform;
+					t.basis.scale(r[i].scale);
+					t = inv_emission_transform * t;
 
 					if (r[i].active) {
+						aabb.add(t);
 						ptr[0] = t.basis.rows[0][0];
 						ptr[1] = t.basis.rows[0][1];
 						ptr[2] = t.basis.rows[0][2];
@@ -1426,6 +1457,9 @@ void CPUParticles3D::_notification(int p_what) {
 
 					ptr += 20;
 				}
+
+				computed_aabb = aabb.finish(mesh_radius);
+				computed_aabb_valid = !aabb.first;
 
 				can_update.set();
 			}
