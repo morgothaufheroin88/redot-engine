@@ -316,8 +316,15 @@ private:
 		AudioStreamPlaybackBusDetails *prev_bus_details = nullptr;
 		/// The next few samples are stored here so we have some time to fade audio out if it ends abruptly at the beginning of the next mix.
 		AudioFrame lookahead[LOOKAHEAD_BUFFER_SIZE];
+		/// Set right before the node is logically removed from `playback_list` (on any thread), so lookups through
+		/// `playback_map` stop returning it exactly when iterating the list would.
+		std::atomic<bool> removed = false;
 	};
 
+	/// Main-thread index of `playback_list` by playback, so the per-frame queries from every AudioStreamPlayer
+	/// don't scan the whole list. Entries are added when a node is inserted and dropped by the node's deletion
+	/// function (run on the main thread by `playback_list.maybe_cleanup()`), so it must outlive `playback_list`.
+	HashMap<AudioStreamPlayback *, AudioStreamPlaybackListNode *> playback_map;
 	SafeList<AudioStreamPlaybackListNode *> playback_list;
 	SafeList<AudioStreamPlaybackBusDetails *> bus_details_graveyard;
 	void _delete_stream_playback(Ref<AudioStreamPlayback> p_playback);

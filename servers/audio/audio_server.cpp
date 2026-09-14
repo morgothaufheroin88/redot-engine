@@ -709,12 +709,11 @@ void AudioServer::_mix_step_for_channel(AudioFrame *p_out_buf, AudioFrame *p_sou
 }
 
 AudioServer::AudioStreamPlaybackListNode *AudioServer::_find_playback_list_node(Ref<AudioStreamPlayback> p_playback) {
-	for (AudioStreamPlaybackListNode *playback_list_node : playback_list) {
-		if (playback_list_node->stream_playback == p_playback) {
-			return playback_list_node;
-		}
+	AudioStreamPlaybackListNode *const *playback_list_node = playback_map.getptr(p_playback.ptr());
+	if (!playback_list_node || (*playback_list_node)->removed.load()) {
+		return nullptr;
 	}
-	return nullptr;
+	return *playback_list_node;
 }
 
 void AudioServer::_delete_stream_playback(Ref<AudioStreamPlayback> p_playback) {
@@ -727,7 +726,13 @@ void AudioServer::_delete_stream_playback(Ref<AudioStreamPlayback> p_playback) {
 
 void AudioServer::_delete_stream_playback_list_node(AudioStreamPlaybackListNode *p_playback_node) {
 	// Remove the playback from the list, registering a destructor to be run on the main thread.
-	playback_list.erase(p_playback_node, [](AudioStreamPlaybackListNode *p) {
+	p_playback_node->removed.store(true);
+	playback_list.erase(p_playback_node, [this](AudioStreamPlaybackListNode *p) {
+		// The playback may have been started again meanwhile, in which case the map points at the newer node.
+		AudioStreamPlaybackListNode **mapped = playback_map.getptr(p->stream_playback.ptr());
+		if (mapped && *mapped == p) {
+			playback_map.erase(p->stream_playback.ptr());
+		}
 		delete p->prev_bus_details;
 		delete p->bus_details.load();
 		p->stream_playback.unref();
@@ -1278,6 +1283,7 @@ void AudioServer::start_playback_stream(Ref<AudioStreamPlayback> p_playback, con
 	playback_node->state.store(AudioStreamPlaybackListNode::PLAYING);
 
 	playback_list.insert(playback_node);
+	playback_map[p_playback.ptr()] = playback_node; // Newest node wins if the playback was restarted while an older one is fading out.
 }
 
 void AudioServer::stop_playback_stream(Ref<AudioStreamPlayback> p_playback) {
