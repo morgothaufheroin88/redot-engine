@@ -1,0 +1,2 @@
+GDTEST_ANALYZER_ERROR
+>> ERROR at line 6: Trait "MassDriver" can only be exported if it extends Node or Resource (e.g. "trait MassDriver extends Node").

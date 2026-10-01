@@ -1,0 +1,3 @@
+GDTEST_OK
+node_gun hint_is_node_type=true hint_is_resource_type=false
+resource_gun hint_is_node_type=false hint_is_resource_type=true

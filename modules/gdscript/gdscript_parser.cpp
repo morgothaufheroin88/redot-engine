@@ -4884,6 +4884,11 @@ bool GDScriptParser::export_annotations(AnnotationNode *p_annotation, Node *p_ta
 					variable->export_info.type = Variant::OBJECT;
 					variable->export_info.hint = PROPERTY_HINT_NODE_TYPE;
 					variable->export_info.hint_string = class_name;
+				} else if (export_type.kind == GDScriptParser::DataType::TRAIT) {
+					// A trait without an explicit base can be used by both Node and Resource
+					// classes, so there is no single inspector representation to pick for it.
+					push_error(vformat(R"(Trait "%s" can only be exported if it extends Node or Resource (e.g. "trait %s extends Node").)", export_type.to_string(), export_type.to_string()), p_annotation);
+					return false;
 				} else {
 					push_error(R"(Export type can only be built-in, a resource, a node, or an enum.)", p_annotation);
 					return false;
@@ -4962,6 +4967,11 @@ bool GDScriptParser::export_annotations(AnnotationNode *p_annotation, Node *p_ta
 						variable->export_info.type = Variant::OBJECT;
 						variable->export_info.hint = PROPERTY_HINT_NODE_TYPE;
 						variable->export_info.hint_string = class_name;
+					} else if (export_type.kind == GDScriptParser::DataType::TRAIT) {
+						// A trait without an explicit base can be used by both Node and Resource
+						// classes, so there is no single inspector representation to pick for it.
+						push_error(vformat(R"(Trait "%s" can only be exported if it extends Node or Resource (e.g. "trait %s extends Node").)", export_type.to_string(), export_type.to_string()), p_annotation);
+						return false;
 					} else {
 						push_error(R"(Export type can only be built-in, a resource, a node, or an enum.)", p_annotation);
 						return false;
